@@ -27,9 +27,13 @@
 
 #include <zebra.h>
 
+#include "lib/if.h"
 #include "lib/jhash.h"
+#include "zebra/interface.h"
 
 #include "bfd.h"
+#include "bfd_lag.h"
+
 
 DEFINE_QOBJ_TYPE(bfd_session);
 
@@ -157,6 +161,33 @@ struct bfd_session *bs_peer_find(struct bfd_peer_cfg *bpc)
 	return bs_peer_waiting_find(bpc);
 }
 
+struct bfd_session *bs_session_find_by_interface(struct bfd_peer_cfg *bpc,
+					  struct interface *ifp)
+{
+	struct bfd_shop_key shop;
+
+	memset(&shop, 0, sizeof(shop));
+	shop.peer = bpc->bpc_peer;
+	shop.ifindex = ifp->ifindex;
+	return bfd_shop_lookup(shop);
+}
+
+
+/**
+ * Looks up either slave or parallel micro-BFD session to the given session
+ */
+struct bfd_session *bs_find_slave_by_interface(struct bfd_session *bs,
+					  struct interface *ifp)
+{
+	struct bfd_shop_key shop;
+
+	memset(&shop, 0, sizeof(shop));
+	shop.peer = bs->shop.peer;
+	shop.ifindex = ifp->ifindex;
+
+	return bfd_shop_lookup(shop);
+}
+
 /*
  * Starts a disabled BFD session.
  *
@@ -229,7 +260,12 @@ int bfd_session_enable(struct bfd_session *bs)
 	 * could use the destination port (3784) for the source
 	 * port we wouldn't need a socket per session.
 	 */
-	if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_IPV6) == 0) {
+	if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MICRO_BFD)) {
+//		psock = bp_micro_bfd_send_socket(bs); /* TODO: rename this to bp_micro_bfd_dummy_send_socket(bs); */
+		psock = bp_peer_socket(bs);
+		if (psock == -1)
+			return -1;
+	} else if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_IPV6) == 0) {
 		psock = bp_peer_socket(bs);
 		if (psock == -1)
 			return -1;
@@ -684,13 +720,47 @@ skip_echo:
 
 static int bfd_session_update(struct bfd_session *bs, struct bfd_peer_cfg *bpc)
 {
+	struct interface *ifp;
+	struct vrf *vrf;
+	struct bfd_session *bss;
+	int num_micro_bfd_int = 0;
+	int num_micro_bfd_sess = 0;
+
 	/* User didn't want to update, return failure. */
 	if (bpc->bpc_createonly)
 		return -1;
 
+	/* If updating a LAG master session -- update the micro-BFD sessions */
+	if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_LAG))
+	{
+		RB_FOREACH (vrf, vrf_name_head, &vrfs_by_name) {
+			FOR_ALL_INTERFACES (vrf, ifp) {
+				if (ifp->master_ifindex == bs->ifp->ifindex) {
+					num_micro_bfd_int++;
+					bss = bs_session_find_by_interface(bpc, ifp);
+					if (!bss)
+						continue;
+
+					log_debug(
+						"Updating the micro-BFD session on interface %s (zif_type %d, zif_slave_type %d) which is slave to %s",
+						bss->ifp->name, bss->ifp->zif_type,
+						bss->ifp->zif_slave_type, bs->ifp->name);
+
+					bfd_session_update(bss, bpc);
+					num_micro_bfd_sess++;
+				}
+			}
+		}
+	}
+
 	_bfd_session_update(bs, bpc);
 
 	control_notify_config(BCM_NOTIFY_CONFIG_UPDATE, bs);
+
+	if (num_micro_bfd_sess > 0)
+		log_debug(
+			"Updated BFD on LAG peer %s with %d interfaces: %d BFD sessions updated",
+			satostr(&bpc->bpc_peer), num_micro_bfd_int, num_micro_bfd_sess);
 
 	return 0;
 }
@@ -720,6 +790,8 @@ static void bfd_session_free(struct bfd_session *bs)
 struct bfd_session *ptm_bfd_sess_new(struct bfd_peer_cfg *bpc)
 {
 	struct bfd_session *bfd, *l_bfd;
+	struct interface *ifp;
+	struct interface *parent_ifp;
 
 	/* check to see if this needs a new session */
 	l_bfd = bs_peer_find(bpc);
@@ -742,8 +814,52 @@ struct bfd_session *ptm_bfd_sess_new(struct bfd_peer_cfg *bpc)
 	 * Store interface/VRF name in case we need to delay session
 	 * start. See `bfd_session_enable` for more information.
 	 */
-	if (bpc->bpc_has_localif)
+	if (bpc->bpc_has_localif) {
 		strlcpy(bfd->ifname, bpc->bpc_localif, sizeof(bfd->ifname));
+		ifp = if_lookup_by_name_all_vrf(bpc->bpc_localif);
+		if (ifp->zif_type == ZEBRA_IF_BOND) {
+			log_info("%s: Creating a dummy BFD session for bond interface %s",
+				__func__, ifp->name); // MMY-DEBUG
+			BFD_SET_FLAG(bfd->flags, BFD_SESS_FLAG_LAG);
+		}
+		else if (ifp->zif_type == ZEBRA_IF_BOND_SLAVE) {
+			log_debug("%s: Creating a micro-BFD session for interface %s",
+				__func__, ifp->name);
+			BFD_SET_FLAG(bfd->flags, BFD_SESS_FLAG_MICRO_BFD);
+
+			// get local ip from the bond interface for bfd_send_eth()
+			if (!bpc->bpc_local.sa_sin.sin_family) {
+				parent_ifp = if_lookup_by_index(ifp->master_ifindex, ifp->vrf_id);
+				log_debug("%s: Found parent ifp->name %s (%d)", __func__, parent_ifp->name, parent_ifp->ifindex);
+
+				struct ifreq ifr_ip;
+				ifr_ip.ifr_addr.sa_family = AF_INET;
+				strncpy(ifr_ip.ifr_name, parent_ifp->name, IFNAMSIZ-1);
+				if (ioctl(bglobal.bg_mbfd, SIOCGIFADDR, &ifr_ip) == -1) {
+					log_debug("%s: ioctl(..., SIOCGIFADDR, ...) returned error (ifr_ip.ifr_name is %s): %s", __func__, ifr_ip.ifr_name, strerror(errno));
+					log_error("%s: failed to discover the local IP address, unable to create micro-BFD session", __func__);
+					return NULL;
+				}
+				else
+					log_debug("%s: ifr_ip.ifr_ifru.ifru_addr is %s", __func__, satostr(&ifr_ip.ifr_addr));
+
+				memcpy(&bpc->bpc_local, (struct sockaddr_any *)&ifr_ip.ifr_addr, sizeof(bfd->local_ip));
+				log_debug("%s: micro-BFD peer config bpc_local set to %s", __func__, satostr(&bpc->bpc_local));
+			} else if (!bpc->bpc_local.sa_sin6.sin6_family) {
+//				bpc->bpc_local.sa_sin6.sin6_family = AF_INET6;
+//				if_get_ipv6_address(parent_ifp, &bpc->bpc_local.sa_sin6.sin6_addr);
+			}
+
+			// create a separate read socket for micro-BFD session
+			bfd->sock_mbfd = bp_micro_bfd_recv_socket(ifp);
+			bfd->t_read_mbfd = NULL;
+
+			thread_add_read(master, bfd_recv_cb, bfd, bfd->sock_mbfd,
+							&bfd->t_read_mbfd);
+			log_debug("%s: created bfd->sd_micro_bfd %d, thread %p",
+				__func__, bfd->sock_mbfd, (void *) bfd->t_read_mbfd);
+		}
+	}
 
 	if (bpc->bpc_has_vrfname)
 		strlcpy(bfd->vrfname, bpc->bpc_vrfname, sizeof(bfd->vrfname));
@@ -767,11 +883,14 @@ struct bfd_session *ptm_bfd_sess_new(struct bfd_peer_cfg *bpc)
 	bfd->local_ip = bpc->bpc_local;
 	bfd->local_address = bpc->bpc_local;
 
-	/* Try to enable session and schedule for packet receive/send. */
-	if (bfd_session_enable(bfd) == -1) {
-		/* Unrecoverable failure, remove the session/peer. */
-		bfd_session_free(bfd);
-		return NULL;
+	// TODO we need session enable for micro-BFD sessions too!
+	if (!BFD_CHECK_FLAG(bfd->flags, BFD_SESS_FLAG_LAG)) {
+		/* Try to enable session and schedule for packet receive/send. */
+		if (bfd_session_enable(bfd) == -1) {
+			/* Unrecoverable failure, remove the session/peer. */
+			bfd_session_free(bfd);
+			return NULL;
+		}
 	}
 
 	/* Apply other configurations. */
@@ -808,6 +927,80 @@ int ptm_bfd_ses_del(struct bfd_peer_cfg *bpc)
 	bfd_session_free(bs);
 
 	return 0;
+}
+
+struct bfd_session *bfd_peer_session_init(struct bfd_peer_cfg *bpc)
+{
+	struct interface *ifp, *ifp_s;
+	struct bfd_session *bfd;
+	struct vrf *vrf;
+	int num_bfd_int = 0;
+	int num_bfd_sess = 0;
+
+	log_info("Setting up BFD for peer %s", satostr(&bpc->bpc_peer)); // MMY-DEBUG
+
+	/*
+	 * Create micro-BFD sessions for each slave interface if running on LAG
+	 * (RFC 7310)
+	 */
+	if (bpc->bpc_has_localif) {
+		ifp = if_lookup_by_name_all_vrf(bpc->bpc_localif);
+		if (ifp == NULL) {
+			log_error("%s: interface %s doesn't exist",
+				__func__, bpc->bpc_localif);
+			return NULL;
+		}
+
+		log_info(
+			"ifp for bpc->bpc_localif %s found: %p (ifp->name %s, ifp->zif_type %d, ifp->zif_slave_type %d, ifp->master_ifindex %d)",
+			bpc->bpc_localif, (void *) ifp, ifp->name, ifp->zif_type,
+			ifp->zif_slave_type, ifp->master_ifindex); // MMY-DEBUG
+
+		if (ifp->zif_type == ZEBRA_IF_BOND) {
+			log_info(
+				"Switching to BFD on LAG mode, as interface %s is a bond interface",
+				ifp->name); // MMY-DEBUG
+
+			RB_FOREACH (vrf, vrf_name_head, &vrfs_by_name) {
+				FOR_ALL_INTERFACES (vrf, ifp_s) {
+					if (ifp_s->master_ifindex == ifp->ifindex) {
+						num_bfd_int++;
+						log_info(
+							"Setting up a micro-BFD session on interface %s (zif_type %d, zif_slave_type %d) which is slave to %s",
+							ifp_s->name, ifp_s->zif_type, ifp_s->zif_slave_type, ifp->name);
+
+						/*
+						 * Temporarily change the local interface in the bpc
+						 * structure to have ptm_bfd_sess_new() create a
+						 * micro-BFD session on it
+						 */
+						strlcpy(bpc->bpc_localif, ifp_s->name, sizeof(bpc->bpc_localif));
+
+						if (ptm_bfd_sess_new(bpc) != NULL)
+							num_bfd_sess++;
+					}
+				}
+			}
+
+			/*
+			 * Revert the local interface name in the bpc structure to
+			 * original value
+			 */
+			strlcpy(bpc->bpc_localif, ifp->name, sizeof(bpc->bpc_localif));
+		}
+	}
+
+	/*
+	 * Create BFD session for the interface given in peer config
+	 * In case of BFD on LAG, the bond interface gets a dummy session
+	 */
+	bfd = ptm_bfd_sess_new(bpc);
+
+	log_info(
+		"BFD init completed for peer %s with %d interfaces: %d BFD sessions created",
+		satostr(&bpc->bpc_peer), num_bfd_int, num_bfd_sess);
+
+	return bfd;
 }
 
 void bfd_set_polling(struct bfd_session *bs)

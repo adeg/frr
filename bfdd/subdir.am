@@ -12,6 +12,7 @@ endif
 
 bfdd_libbfd_a_SOURCES = \
 	bfdd/bfd.c \
+	bfdd/bfd_lag.c \
 	bfdd/bfdd_vty.c \
 	bfdd/bfd_packet.c \
 	bfdd/bsd.c \

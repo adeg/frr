@@ -58,6 +58,8 @@ static int bfd_configure_peer(struct bfd_peer_cfg *bpc, bool mhop,
 			      const struct sockaddr_any *local,
 			      const char *ifname, const char *vrfname,
 			      char *ebuf, size_t ebuflen);
+static int _bfd_session_shutdown(struct bfd_session *bs, bool no);
+static int bfd_session_shutdown(struct bfd_session *bs, bool no);
 
 static void _display_peer_header(struct vty *vty, struct bfd_session *bs);
 static struct json_object *__display_peer_json(struct bfd_session *bs);
@@ -152,7 +154,7 @@ DEFUN_NOSH(
 
 	bs = bs_peer_find(&bpc);
 	if (bs == NULL) {
-		bs = ptm_bfd_sess_new(&bpc);
+		bs = bfd_peer_session_init(&bpc);
 		if (bs == NULL) {
 			vty_out(vty, "%% Failed to add peer.\n");
 			return CMD_WARNING_CONFIG_FAILED;
@@ -236,40 +238,24 @@ DEFPY(bfd_peer_shutdown, bfd_peer_shutdown_cmd, "[no] shutdown",
 	struct bfd_session *bs;
 
 	bs = VTY_GET_CONTEXT(bfd_session);
+
+	/*
 	if (no) {
-		if (!BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_SHUTDOWN))
-			return CMD_SUCCESS;
-
-		BFD_UNSET_FLAG(bs->flags, BFD_SESS_FLAG_SHUTDOWN);
-
-		/* Change and notify state change. */
-		bs->ses_state = PTM_BFD_DOWN;
-		control_notify(bs);
-
-		/* Enable all timers. */
-		bfd_recvtimer_update(bs);
-		bfd_xmttimer_update(bs, bs->xmt_TO);
-		if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_ECHO)) {
-			bfd_echo_recvtimer_update(bs);
-			bfd_echo_xmttimer_update(bs, bs->echo_xmt_TO);
-		}
+		vty_out(vty, "%% Going to no-shutdown this peer\n");
+		bfd_session_shutdown(bs, true);
 	} else {
-		if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_SHUTDOWN))
-			return CMD_SUCCESS;
+		vty_out(vty, "%% Going to shutdown this peer\n");
+		bfd_session_shutdown(bs, false);
+	}*/
 
-		BFD_SET_FLAG(bs->flags, BFD_SESS_FLAG_SHUTDOWN);
-
-		/* Disable all events. */
-		bfd_recvtimer_delete(bs);
-		bfd_echo_recvtimer_delete(bs);
-		bfd_xmttimer_delete(bs);
-		bfd_echo_xmttimer_delete(bs);
-
-		/* Change and notify state change. */
-		bs->ses_state = PTM_BFD_ADM_DOWN;
-		control_notify(bs);
-
-		ptm_bfd_snd(bs, 0);
+	/*
+	if (bfd_session_shutdown(bs, (no ? true : false)) != 0) {
+		vty_out(vty, "%% Command failed.\n");
+		return CMD_WARNING_CONFIG_FAILED;
+	}*/
+	if (bfd_session_shutdown(bs, no) != 0) {
+		vty_out(vty, "%% Command failed.\n");
+		return CMD_WARNING_CONFIG_FAILED;
 	}
 
 	return CMD_SUCCESS;
@@ -907,6 +893,94 @@ static int bfd_configure_peer(struct bfd_peer_cfg *bpc, bool mhop,
 
 	return 0;
 }
+
+static int _bfd_session_shutdown(struct bfd_session *bs, bool no)
+{
+	if (no) {
+		if (!BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_SHUTDOWN))
+			return 0;
+
+		BFD_UNSET_FLAG(bs->flags, BFD_SESS_FLAG_SHUTDOWN);
+
+		/* Change and notify state change. */
+		bs->ses_state = PTM_BFD_DOWN;
+		control_notify(bs);
+
+		/* Enable all timers. */
+		bfd_recvtimer_update(bs);
+		bfd_xmttimer_update(bs, bs->xmt_TO);
+		if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_ECHO)) {
+			bfd_echo_recvtimer_update(bs);
+			bfd_echo_xmttimer_update(bs, bs->echo_xmt_TO);
+		}
+	} else {
+		if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_SHUTDOWN))
+			return 0;
+
+		BFD_SET_FLAG(bs->flags, BFD_SESS_FLAG_SHUTDOWN);
+
+		/* Disable all events. */
+		bfd_recvtimer_delete(bs);
+		bfd_echo_recvtimer_delete(bs);
+		bfd_xmttimer_delete(bs);
+		bfd_echo_xmttimer_delete(bs);
+
+		/* Change and notify state change. */
+		bs->ses_state = PTM_BFD_ADM_DOWN;
+		control_notify(bs);
+
+		ptm_bfd_snd(bs, 0);
+	}
+
+	return 0;
+}
+
+static int bfd_session_shutdown(struct bfd_session *bs, bool no)
+{
+	struct interface *ifp, *slave_ifp;
+	struct vrf *vrf;
+	struct bfd_session *slave_bs;
+	int num_micro_bfd_int = 0;
+	int num_micro_bfd_sess = 0;
+
+	/* If updating a LAG master session -- update the micro-BFD sessions */
+	if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_LAG))
+	{
+		ifp = if_lookup_by_name_all_vrf(bs->ifname);
+		if (ifp == NULL)
+			return -1;
+
+		RB_FOREACH (vrf, vrf_name_head, &vrfs_by_name) {
+			FOR_ALL_INTERFACES (vrf, slave_ifp) {
+				if (slave_ifp->master_ifindex == ifp->ifindex) {
+					num_micro_bfd_int++;
+					slave_bs = bs_find_slave_by_interface(bs, slave_ifp);
+					if (!slave_bs)
+						continue;
+
+					log_debug(
+						"%s the micro-BFD session on interface %s which is slave to %s",
+						no ? "Activating" : "Shutting down",
+						slave_bs->ifp->name, ifp->name);
+
+					if (_bfd_session_shutdown(slave_bs, no) == 0)
+						num_micro_bfd_sess++;
+				}
+			}
+		}
+	}
+
+	_bfd_session_shutdown(bs, no);
+
+	if (num_micro_bfd_sess > 0)
+		log_debug(
+			"%s BFD-on-LAG peer %s with %d interfaces: %d BFD sessions updated",
+			no ? "Enabled" : "Shut down",
+			satostr(&bs->shop.peer), num_micro_bfd_int, num_micro_bfd_sess);
+
+	return 0;
+}
+
 static int bfdd_write_config(struct vty *vty)
 {
 	vty_out(vty, "bfd\n");
@@ -916,6 +990,13 @@ static int bfdd_write_config(struct vty *vty)
 
 static void _bfdd_peer_write_config(struct vty *vty, struct bfd_session *bs)
 {
+	/*
+	 * never write config for micro-LAG sessions as their config is
+	 * derived from the master in the current implementation
+	 */
+	if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MICRO_BFD))
+		return;
+
 	if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MH)) {
 		vty_out(vty, " peer %s", satostr(&bs->mhop.peer));
 		vty_out(vty, " multihop");
@@ -933,8 +1014,9 @@ static void _bfdd_peer_write_config(struct vty *vty, struct bfd_session *bs)
 		vty_out(vty, "\n");
 	}
 
-	if (bs->sock == -1)
-		vty_out(vty, "  ! vrf or interface doesn't exist\n");
+	if (!BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_LAG)) /* ignore LAG master */
+		if (bs->sock == -1)
+			vty_out(vty, "  ! vrf or interface doesn't exist\n");
 
 	if (bs->detect_mult != BPC_DEF_DETECTMULTIPLIER)
 		vty_out(vty, "  detect-multiplier %d\n", bs->detect_mult);

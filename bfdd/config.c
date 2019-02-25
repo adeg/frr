@@ -62,7 +62,7 @@ static int json_object_add_peer(struct json_object *jo, struct bfd_session *bs);
 static int config_add(struct bfd_peer_cfg *bpc,
 		      void *arg __attribute__((unused)))
 {
-	return ptm_bfd_sess_new(bpc) == NULL;
+	return bfd_peer_session_init(bpc) == NULL;
 }
 
 static int config_del(struct bfd_peer_cfg *bpc,

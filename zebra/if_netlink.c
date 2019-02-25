@@ -589,6 +589,7 @@ static int netlink_interface(struct nlmsghdr *h, ns_id_t ns_id, int startup)
 	vrf_id_t vrf_id = VRF_DEFAULT;
 	zebra_iftype_t zif_type = ZEBRA_IF_OTHER;
 	zebra_slave_iftype_t zif_slave_type = ZEBRA_IF_SLAVE_NONE;
+	ifindex_t master_ifindex = IFINDEX_INTERNAL;
 	ifindex_t bridge_ifindex = IFINDEX_INTERNAL;
 	ifindex_t link_ifindex = IFINDEX_INTERNAL;
 	ifindex_t bond_ifindex = IFINDEX_INTERNAL;
@@ -663,9 +664,11 @@ static int netlink_interface(struct nlmsghdr *h, ns_id_t ns_id, int startup)
 			zif_slave_type = ZEBRA_IF_SLAVE_BRIDGE;
 			bridge_ifindex =
 				*(ifindex_t *)RTA_DATA(tb[IFLA_MASTER]);
+			master_ifindex = bridge_ifindex;
 		} else if (slave_kind && (strcmp(slave_kind, "bond") == 0)) {
 			zif_slave_type = ZEBRA_IF_SLAVE_BOND;
 			bond_ifindex = *(ifindex_t *)RTA_DATA(tb[IFLA_MASTER]);
+			master_ifindex = bond_ifindex;
 		} else
 			zif_slave_type = ZEBRA_IF_SLAVE_OTHER;
 	}
@@ -699,6 +702,7 @@ static int netlink_interface(struct nlmsghdr *h, ns_id_t ns_id, int startup)
 	 * before lower devices. We will setup the real linkage once the dump
 	 * is complete.
 	 */
+	ifp->master_ifindex = master_ifindex;
 	zif = (struct zebra_if *)ifp->info;
 	zif->link_ifindex = link_ifindex;
 
@@ -1109,6 +1113,7 @@ int netlink_link_change(struct nlmsghdr *h, ns_id_t ns_id, int startup)
 	vrf_id_t vrf_id = VRF_DEFAULT;
 	zebra_iftype_t zif_type = ZEBRA_IF_OTHER;
 	zebra_slave_iftype_t zif_slave_type = ZEBRA_IF_SLAVE_NONE;
+	ifindex_t master_ifindex = IFINDEX_INTERNAL;
 	ifindex_t bridge_ifindex = IFINDEX_INTERNAL;
 	ifindex_t bond_ifindex = IFINDEX_INTERNAL;
 	ifindex_t link_ifindex = IFINDEX_INTERNAL;
@@ -1210,11 +1215,13 @@ int netlink_link_change(struct nlmsghdr *h, ns_id_t ns_id, int startup)
 				zif_slave_type = ZEBRA_IF_SLAVE_BRIDGE;
 				bridge_ifindex =
 					*(ifindex_t *)RTA_DATA(tb[IFLA_MASTER]);
+				master_ifindex = bridge_ifindex;
 			} else if (slave_kind
 				   && (strcmp(slave_kind, "bond") == 0)) {
 				zif_slave_type = ZEBRA_IF_SLAVE_BOND;
 				bond_ifindex =
 					*(ifindex_t *)RTA_DATA(tb[IFLA_MASTER]);
+				master_ifindex = bond_ifindex;
 			} else
 				zif_slave_type = ZEBRA_IF_SLAVE_OTHER;
 		}
@@ -1260,6 +1267,7 @@ int netlink_link_change(struct nlmsghdr *h, ns_id_t ns_id, int startup)
 					 ZEBRA_INTERFACE_VRF_LOOPBACK);
 
 			/* Update link. */
+			ifp->master_ifindex = master_ifindex;
 			zebra_if_update_link(ifp, link_ifindex, ns_id);
 
 			netlink_interface_update_hw_addr(tb, ifp);
@@ -1312,6 +1320,7 @@ int netlink_link_change(struct nlmsghdr *h, ns_id_t ns_id, int startup)
 			was_bridge_slave = IS_ZEBRA_IF_BRIDGE_SLAVE(ifp);
 			was_bond_slave = IS_ZEBRA_IF_BOND_SLAVE(ifp);
 			zebra_if_set_ziftype(ifp, zif_type, zif_slave_type);
+			ifp->master_ifindex = master_ifindex;
 
 			memcpy(old_hw_addr, ifp->hw_addr, INTERFACE_HWADDR_MAX);
 

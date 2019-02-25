@@ -443,7 +443,8 @@ static void bfdd_dest_register(struct stream *msg)
 	/* Find or start new BFD session. */
 	bs = bs_peer_find(&bpc);
 	if (bs == NULL) {
-		bs = ptm_bfd_sess_new(&bpc);
+//		bs = ptm_bfd_sess_new(&bpc);
+		bs = bfd_peer_session_init(&bpc);
 		if (bs == NULL) {
 			log_debug("ptm-add-dest: failed to create BFD session");
 			return;

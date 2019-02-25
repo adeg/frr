@@ -39,8 +39,7 @@ DEFINE_MTYPE(BFDD, BFDD_NOTIFICATION, "short-lived control notification data");
 struct thread_master *master;
 
 /* BFDd privileges */
-static zebra_capabilities_t _caps_p[] = {ZCAP_BIND};
-
+static zebra_capabilities_t _caps_p[] = {ZCAP_BIND, ZCAP_NET_RAW};
 struct zebra_privs_t bfdd_privs = {
 #if defined(FRR_USER) && defined(FRR_GROUP)
 	.user = FRR_USER,
@@ -91,6 +90,7 @@ static void sigterm_handler(void)
 	socket_close(&bglobal.bg_mhop);
 	socket_close(&bglobal.bg_shop6);
 	socket_close(&bglobal.bg_mhop6);
+	socket_close(&bglobal.bg_mbfd);
 
 	/* Terminate and free() FRR related memory. */
 	frr_fini();
@@ -119,8 +119,10 @@ FRR_DAEMON_INFO(bfdd, BFD, .vty_port = 2617,
 		.privs = &bfdd_privs)
 
 #define OPTION_CTLSOCK 1001
+#define OPTION_ENABLE_MICROBFD 1002
 static struct option longopts[] = {
 	{"bfdctl", required_argument, NULL, OPTION_CTLSOCK},
+	{"enable-microbfd", no_argument, NULL, OPTION_ENABLE_MICROBFD},
 	{0}
 };
 
@@ -162,11 +164,13 @@ static void bg_init(void)
 	bglobal.bg_mhop6 = bp_udp6_mhop();
 	bglobal.bg_echo = bp_echo_socket();
 	bglobal.bg_echov6 = bp_echov6_socket();
+	bglobal.bg_mbfd = bp_udp_micro_bfd();
 }
 
 int main(int argc, char *argv[])
 {
 	const char *ctl_path = BFDD_CONTROL_SOCKET;
+	bool microbfd_enabled = false;
 	int opt;
 
 	frr_preinit(&bfdd_di, argc, argv);
@@ -182,6 +186,9 @@ int main(int argc, char *argv[])
 		case OPTION_CTLSOCK:
 			ctl_path = optarg;
 			break;
+
+		case OPTION_ENABLE_MICROBFD:
+			microbfd_enabled = true;
 
 		default:
 			frr_help_exit(1);
@@ -226,6 +233,10 @@ int main(int argc, char *argv[])
 			&bglobal.bg_ev[5]);
 	thread_add_read(master, control_accept, NULL, bglobal.bg_csock,
 			&bglobal.bg_csockev);
+	/*
+	 * ^ not adding read thread for the global micro-BFD listen
+	 * socket as we will be using per-session PF_PACKET sockets
+	 */
 
 	/* Install commands. */
 	bfdd_vty_init();

@@ -36,6 +36,7 @@
 #include "lib/sockopt.h"
 
 #include "bfd.h"
+#include "bfd_lag.h"
 
 
 /*
@@ -46,6 +47,9 @@ int _ptm_bfd_send(struct bfd_session *bs, uint16_t *port, const void *data,
 		  size_t datalen);
 
 static void bfd_sd_reschedule(int sd);
+ssize_t bfd_recv_eth(int sd, uint8_t *msgbuf, size_t msgbuflen, uint8_t *ttl,
+		      ifindex_t *ifindex, struct sockaddr_any *local,
+		      struct sockaddr_any *peer);
 ssize_t bfd_recv_ipv4(int sd, uint8_t *msgbuf, size_t msgbuflen, uint8_t *ttl,
 		      ifindex_t *ifindex, struct sockaddr_any *local,
 		      struct sockaddr_any *peer);
@@ -58,10 +62,15 @@ int bp_bfd_echo_in(int sd, uint8_t *ttl, uint32_t *my_discr);
 
 /* socket related prototypes */
 static void bp_set_ipopts(int sd);
-static void bp_bind_ip(int sd, uint16_t port);
 static void bp_set_ipv6opts(int sd);
 static void bp_bind_ipv6(int sd, uint16_t port);
 
+int bfd_proc_micro_lag_down_pkt(struct bfd_pkt *cp, struct sockaddr_any *peer,
+				      struct sockaddr_any *local, ifindex_t ifindex,
+					  vrf_id_t vrfid, bool is_mhop);
+int bfd_recv_micro_lag_down_pkt(struct bfd_pkt *cp, struct sockaddr_any *peer,
+				      struct sockaddr_any *local, ifindex_t ifindex,
+					  vrf_id_t vrfid, bool is_mhop);
 
 /*
  * Functions
@@ -72,19 +81,26 @@ int _ptm_bfd_send(struct bfd_session *bs, uint16_t *port, const void *data,
 	struct sockaddr *sa;
 	struct sockaddr_in sin;
 	struct sockaddr_in6 sin6;
+	uint16_t dest_port;
 	socklen_t slen;
 	ssize_t rv;
 	int sd = -1;
+
+	if (port) {
+		dest_port = *port;
+	} else if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MH)) {
+		dest_port = htons(BFD_DEF_MHOP_DEST_PORT);
+	} else if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MICRO_BFD)) {
+		dest_port = htons(BFD_DEF_MICRO_BFD_PORT);
+	} else {
+		dest_port = htons(BFD_DEFDESTPORT);
+	}
 
 	if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_IPV6)) {
 		memset(&sin6, 0, sizeof(sin6));
 		sin6.sin6_family = AF_INET6;
 		sin6.sin6_addr = bs->shop.peer.sa_sin6.sin6_addr;
-		sin6.sin6_port =
-			(port) ? *port
-			       : (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MH))
-					 ? htons(BFD_DEF_MHOP_DEST_PORT)
-					 : htons(BFD_DEFDESTPORT);
+		sin6.sin6_port = dest_port;
 
 		sd = bs->sock;
 		sa = (struct sockaddr *)&sin6;
@@ -93,11 +109,7 @@ int _ptm_bfd_send(struct bfd_session *bs, uint16_t *port, const void *data,
 		memset(&sin, 0, sizeof(sin));
 		sin.sin_family = AF_INET;
 		sin.sin_addr = bs->shop.peer.sa_sin.sin_addr;
-		sin.sin_port =
-			(port) ? *port
-			       : (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MH))
-					 ? htons(BFD_DEF_MHOP_DEST_PORT)
-					 : htons(BFD_DEFDESTPORT);
+		sin.sin_port = dest_port;
 
 		sd = bs->sock;
 		sa = (struct sockaddr *)&sin;
@@ -113,7 +125,7 @@ int _ptm_bfd_send(struct bfd_session *bs, uint16_t *port, const void *data,
 		return -1;
 	}
 	if (rv < (ssize_t)datalen)
-		log_debug("packet-send: send partial", strerror(errno));
+		log_debug("packet-send: send partial: %s", strerror(errno));
 
 	return 0;
 }
@@ -204,6 +216,7 @@ static int ptm_bfd_process_echo_pkt(int s)
 void ptm_bfd_snd(struct bfd_session *bfd, int fbit)
 {
 	struct bfd_pkt cp;
+	int rv;
 
 	/* Set fields according to section 6.5.7 */
 	cp.diag = bfd->local_diag;
@@ -244,7 +257,12 @@ void ptm_bfd_snd(struct bfd_session *bfd, int fbit)
 	}
 	cp.timers.required_min_echo = htonl(bfd->timers.required_min_echo);
 
-	if (_ptm_bfd_send(bfd, NULL, &cp, BFD_PKT_LEN) != 0)
+	if (BFD_CHECK_FLAG(bfd->flags, BFD_SESS_FLAG_MICRO_BFD))
+		rv = bfd_send_eth(bfd, NULL, &cp, BFD_PKT_LEN);
+	else
+		rv = _ptm_bfd_send(bfd, NULL, &cp, BFD_PKT_LEN);
+
+	if (rv != 0)
 		return;
 
 	bfd->stats.tx_ctrl_pkt++;
@@ -460,6 +478,7 @@ static void bfd_sd_reschedule(int sd)
 		thread_add_read(master, bfd_recv_cb, NULL, bglobal.bg_echov6,
 				&bglobal.bg_ev[5]);
 	}
+	/* no reschedule for the micro-BFD global listen socket */
 }
 
 static void cp_debug(bool mhop, struct sockaddr_any *peer,
@@ -501,9 +520,10 @@ static void cp_debug(bool mhop, struct sockaddr_any *peer,
 int bfd_recv_cb(struct thread *t)
 {
 	int sd = THREAD_FD(t);
-	struct bfd_session *bfd;
+	struct bfd_session *bfd = THREAD_ARG(t); /* NULL for non-micro-BFD */
 	struct bfd_pkt *cp;
 	bool is_mhop;
+	bool is_microbfd = false;
 	ssize_t mlen = 0;
 	uint8_t ttl = 0;
 	vrf_id_t vrfid = VRF_DEFAULT;
@@ -512,7 +532,12 @@ int bfd_recv_cb(struct thread *t)
 	uint8_t msgbuf[1516];
 
 	/* Schedule next read. */
-	bfd_sd_reschedule(sd);
+	if (bfd != NULL) {
+		is_microbfd = true;
+		bfd_micro_sd_reschedule(sd, bfd);
+	} else {
+		bfd_sd_reschedule(sd);
+	}
 
 	/* Handle echo packets. */
 	if (sd == bglobal.bg_echo || sd == bglobal.bg_echov6) {
@@ -526,6 +551,7 @@ int bfd_recv_cb(struct thread *t)
 
 	/* Handle control packets. */
 	is_mhop = false;
+	/* single-hop, multi-hop control packets (IPv4/IPv6) */
 	if (sd == bglobal.bg_shop || sd == bglobal.bg_mhop) {
 		is_mhop = sd == bglobal.bg_mhop;
 		mlen = bfd_recv_ipv4(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex,
@@ -534,6 +560,20 @@ int bfd_recv_cb(struct thread *t)
 		is_mhop = sd == bglobal.bg_mhop6;
 		mlen = bfd_recv_ipv6(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex,
 				     &local, &peer);
+	} else if (is_microbfd) { /* micro-BFD ctrl pkts v4/v6 */
+		is_microbfd = true;
+		mlen = bfd_recv_eth(sd, msgbuf, sizeof(msgbuf), &ttl, &ifindex,
+					 &local, &peer);
+		if (mlen == -1) {
+//			log_debug("%s: bfd_recv_eth() returned error", __func__);
+			return 0;
+		}
+
+#if 0
+		log_debug(
+			"%s: mlen is %d. bfd_recv_ipv4 reported ifindex %d, bfd_session ifindex is %d",
+			__func__, mlen, ifindex, bfd->ifp->ifindex);
+#endif
 	}
 
 	/* Implement RFC 5880 6.8.6 */
@@ -557,7 +597,11 @@ int bfd_recv_cb(struct thread *t)
 	 * - Short packets;
 	 * - Invalid discriminator;
 	 */
-	cp = (struct bfd_pkt *)(msgbuf);
+	if (is_microbfd)
+		cp = (struct bfd_pkt *)(msgbuf + sizeof(struct udphdr) + sizeof(struct ip) + sizeof(struct ether_header));
+	else
+		cp = (struct bfd_pkt *)(msgbuf);
+
 	if (BFD_GETVER(cp->diag) != BFD_VERSION) {
 		cp_debug(is_mhop, &peer, &local, ifindex, vrfid,
 			 "bad version %d", BFD_GETVER(cp->diag));
@@ -582,7 +626,8 @@ int bfd_recv_cb(struct thread *t)
 	}
 
 	/* Find the session that this packet belongs. */
-	bfd = ptm_bfd_sess_find(cp, &peer, &local, ifindex, vrfid, is_mhop);
+	if (bfd == NULL)
+		bfd = ptm_bfd_sess_find(cp, &peer, &local, ifindex, vrfid, is_mhop);
 	if (bfd == NULL) {
 		cp_debug(is_mhop, &peer, &local, ifindex, vrfid,
 			 "no session found");
@@ -661,7 +706,7 @@ int bfd_recv_cb(struct thread *t)
 		bs_final_handler(bfd);
 
 		/* Send the control packet with the final bit immediately. */
-		ptm_bfd_snd(bfd, 1);
+		ptm_bfd_snd(bfd, 1); /* TODO: Add micro-BFD scenario */
 	}
 
 	return 0;
@@ -852,7 +897,7 @@ static void bp_set_ipopts(int sd)
 #endif /* BFD_BSD */
 }
 
-static void bp_bind_ip(int sd, uint16_t port)
+void bp_bind_ip(int sd, uint16_t port)
 {
 	struct sockaddr_in sin;
 
@@ -897,6 +942,7 @@ int bp_peer_socket(const struct bfd_session *bs)
 	int sd, pcount;
 	struct sockaddr_in sin;
 	static int srcPort = BFD_SRCPORTINIT;
+	int shop_dontroute = BFD_SHOP_DONTROUTE;
 
 	sd = socket(AF_INET, SOCK_DGRAM, PF_UNSPEC);
 	if (sd == -1) {
@@ -922,6 +968,10 @@ int bp_peer_socket(const struct bfd_session *bs)
 			close(sd);
 			return -1;
 		}
+		if (setsockopt(sd, SOL_SOCKET, SO_DONTROUTE, &shop_dontroute,
+				sizeof(shop_dontroute)) == -1)
+			log_fatal("%s: setsockopt(SO_DONTROUTE, %d): %s", __func__,
+					shop_dontroute, strerror(errno));
 	} else if (BFD_CHECK_FLAG(bs->flags, BFD_SESS_FLAG_MH) &&
 		   bs->mhop.vrfid != VRF_DEFAULT) {
 		if (bp_bind_dev(sd, bs->vrf->name) != 0) {

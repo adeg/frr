@@ -1480,7 +1480,7 @@ void zebra_ptm_bfd_dst_replay(ZAPI_HANDLER_ARGS)
 	 * originated from the `bfdd` daemon.
 	 */
 	if (IS_ZEBRA_DEBUG_EVENT)
-		zlog_debug("bfd_dst_update msg from client %s: length=%d",
+		zlog_debug("bfd_dest_update msg from client %s: length=%d",
 			   zebra_route_string(client->proto), hdr->length);
 
 	/*

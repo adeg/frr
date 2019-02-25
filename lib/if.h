@@ -94,6 +94,28 @@ enum zebra_link_type {
 	ZEBRA_LLT_IEEE802154_PHY,
 };
 
+/* Zebra interface type - ones of interest. */
+typedef enum {
+	ZEBRA_IF_OTHER = 0, /* Anything else */
+	ZEBRA_IF_VXLAN,     /* VxLAN interface */
+	ZEBRA_IF_VRF,       /* VRF device */
+	ZEBRA_IF_BRIDGE,    /* bridge device */
+	ZEBRA_IF_VLAN,      /* VLAN sub-interface */
+	ZEBRA_IF_MACVLAN,   /* MAC VLAN interface*/
+	ZEBRA_IF_VETH,      /* VETH interface*/
+	ZEBRA_IF_BOND,	    /* Bond */
+	ZEBRA_IF_BOND_SLAVE,	    /* Bond */
+} zebra_iftype_t;
+
+/* Zebra "slave" interface type */
+typedef enum {
+	ZEBRA_IF_SLAVE_NONE,   /* Not a slave */
+	ZEBRA_IF_SLAVE_VRF,    /* Member of a VRF */
+	ZEBRA_IF_SLAVE_BRIDGE, /* Member of a bridge */
+	ZEBRA_IF_SLAVE_BOND,   /* Bond member */
+	ZEBRA_IF_SLAVE_OTHER,  /* Something else - e.g., bond slave */
+} zebra_slave_iftype_t;
+
 /*
   Interface name length.
 
@@ -276,6 +298,14 @@ struct interface {
 	/* Daemon specific interface data pointer. */
 	void *info;
 
+	/* Zebra interface and "slave" interface type */
+	zebra_iftype_t zif_type; /* corresponds to netlink IFLA_INFO_KIND */
+	zebra_slave_iftype_t zif_slave_type; /* netlink IFLA_INFO_SLAVE_KIND */
+
+	/* Reference to master interface ifindex as in IFLA_MASTER, however
+	 * does NOT link to VRF as a separate field (vrf_id) is used for this */
+	ifindex_t master_ifindex;
+
 	char ptm_enable; /* Should we look at ptm_status ? */
 	char ptm_status;
 
@@ -333,6 +363,12 @@ DECLARE_QOBJ_TYPE(interface)
 
 #define FOR_ALL_INTERFACES_ADDRESSES(ifp, connected, node)                     \
 	for (ALL_LIST_ELEMENTS_RO(ifp->connected, node, connected))
+/* MMY::::NOT NEEDED ANYMORE */
+#define IS_IF_BRIDGE_SLAVE(ifp)					                               \
+	(ifp->info_slave_kind && (strcmp(ifp->info_slave_kind, "bridge") == 0))
+
+#define IS_IF_BOND_SLAVE(ifp)					                               \
+	(ifp->info_slave_kind && (strcmp(ifp->info_slave_kind, "bond") == 0))
 
 /* called from the library code whenever interfaces are created/deleted
  * note: interfaces may not be fully realized at that point; also they

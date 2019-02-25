@@ -25,6 +25,7 @@
 
 #include "bfd.h"
 
+extern struct zebra_privs_t bfdd_privs;
 
 /*
  * Definitions.
@@ -32,19 +33,15 @@
 int bp_bind_dev(int sd __attribute__((__unused__)),
 		const char *dev __attribute__((__unused__)))
 {
-	/*
-	 * TODO: implement this differently. It is not possible to
-	 * SO_BINDTODEVICE after the daemon has dropped its privileges.
-	 */
-#if 0
-	size_t devlen = strlen(dev) + 1;
+	frr_elevate_privs(&bfdd_privs) {
+		size_t devlen = strlen(dev) + 1;
 
-	if (setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, dev, devlen) == -1) {
-		log_warning("%s: setsockopt(SO_BINDTODEVICE, \"%s\"): %s",
-			    __func__, dev, strerror(errno));
-		return -1;
+		if (setsockopt(sd, SOL_SOCKET, SO_BINDTODEVICE, dev, devlen) == -1) {
+			log_warning("%s: setsockopt(SO_BINDTODEVICE, \"%s\"): %s",
+					__func__, dev, strerror(errno));
+			return -1;
+		}
 	}
-#endif
 
 	return 0;
 }

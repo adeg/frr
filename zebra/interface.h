@@ -235,28 +235,6 @@ struct rtadv_dnssl {
 
 #endif /* HAVE_RTADV */
 
-/* Zebra interface type - ones of interest. */
-typedef enum {
-	ZEBRA_IF_OTHER = 0, /* Anything else */
-	ZEBRA_IF_VXLAN,     /* VxLAN interface */
-	ZEBRA_IF_VRF,       /* VRF device */
-	ZEBRA_IF_BRIDGE,    /* bridge device */
-	ZEBRA_IF_VLAN,      /* VLAN sub-interface */
-	ZEBRA_IF_MACVLAN,   /* MAC VLAN interface*/
-	ZEBRA_IF_VETH,      /* VETH interface*/
-	ZEBRA_IF_BOND,	    /* Bond */
-	ZEBRA_IF_BOND_SLAVE,	    /* Bond */
-} zebra_iftype_t;
-
-/* Zebra "slave" interface type */
-typedef enum {
-	ZEBRA_IF_SLAVE_NONE,   /* Not a slave */
-	ZEBRA_IF_SLAVE_VRF,    /* Member of a VRF */
-	ZEBRA_IF_SLAVE_BRIDGE, /* Member of a bridge */
-	ZEBRA_IF_SLAVE_BOND,   /* Bond member */
-	ZEBRA_IF_SLAVE_OTHER,  /* Something else - e.g., bond slave */
-} zebra_slave_iftype_t;
-
 struct irdp_interface;
 
 /* `zebra' daemon local interface structure. */
@@ -351,6 +329,8 @@ static inline void zebra_if_set_ziftype(struct interface *ifp,
 {
 	struct zebra_if *zif;
 
+	ifp->zif_type = zif_type;
+	ifp->zif_slave_type = zif_slave_type;
 	zif = (struct zebra_if *)ifp->info;
 	zif->zif_type = zif_type;
 	zif->zif_slave_type = zif_slave_type;

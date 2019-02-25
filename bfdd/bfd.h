@@ -166,6 +166,8 @@ enum bfd_session_flags {
 						 * expires
 						 */
 	BFD_SESS_FLAG_SHUTDOWN = 1 << 7,	/* disable BGP peer function */
+	BFD_SESS_FLAG_LAG = 1 << 8,		/* BFD on LAG master session */
+	BFD_SESS_FLAG_MICRO_BFD = 1 << 9,		/* micro-BFD session */
 };
 
 #define BFD_SET_FLAG(field, flag) (field |= flag)
@@ -253,6 +255,10 @@ struct bfd_session {
 	uint8_t remote_diag;
 	struct bfd_timers remote_timers;
 
+	/* micro-BFD session dedicated socket and read thread */
+	int sock_mbfd;
+	struct thread *t_read_mbfd;
+
 	uint64_t refcount; /* number of pointers referencing this. */
 
 	/* VTY context data. */
@@ -307,6 +313,7 @@ TAILQ_HEAD(obslist, bfd_session_observer);
 #define BFD_PKT_LEN 24 /* Length of control packet */
 #define BFD_TTL_VAL 255
 #define BFD_RCV_TTL_VAL 1
+#define BFD_SHOP_DONTROUTE 1
 #define BFD_TOS_VAL 0xC0
 #define BFD_PKT_INFO_VAL 1
 #define BFD_IPV6_PKT_INFO_VAL 1
@@ -316,6 +323,9 @@ TAILQ_HEAD(obslist, bfd_session_observer);
 #define BFD_DEFDESTPORT 3784
 #define BFD_DEF_ECHO_PORT 3785
 #define BFD_DEF_MHOP_DEST_PORT 4784
+#define BFD_DEF_MICRO_BFD_PORT 6784 /* per RFC 7130 section 2.2 */
+/* RFC 7130 section 2.3 */
+extern uint8_t const BFD_SHOP_MICRO_BFD_PEER_ADDR[6] = {0x01, 0x00, 0x5e, 0x90, 0x00, 0x01};
 
 /*
  * control.c
@@ -388,6 +398,7 @@ struct bfd_global {
 	int bg_mhop6;
 	int bg_echo;
 	int bg_echov6;
+	int bg_mbfd;
 	struct thread *bg_ev[6];
 
 	int bg_csock;
@@ -401,6 +412,7 @@ struct bfd_global {
 extern struct bfd_global bglobal;
 extern struct bfd_diag_str_list diag_list[];
 extern struct bfd_state_str_list state_list[];
+extern struct zebra_privs_t bfdd_privs;
 
 void socket_close(int *s);
 
@@ -460,11 +472,15 @@ int bp_set_ttl(int sd, uint8_t value);
 int bp_set_tosv6(int sd, uint8_t value);
 int bp_set_tos(int sd, uint8_t value);
 int bp_bind_dev(int sd, const char *dev);
+void bp_bind_ip(int sd, uint16_t port);
 
 int bp_udp_shop(void);
 int bp_udp_mhop(void);
 int bp_udp6_shop(void);
 int bp_udp6_mhop(void);
+int bp_udp_micro_bfd();
+int bp_pfp_micro_bfd();
+int bp_udp_micro_bfd_all(void);
 int bp_peer_socket(const struct bfd_session *bs);
 int bp_peer_socketv6(const struct bfd_session *bs);
 int bp_echo_socket(void);
@@ -474,6 +490,7 @@ void ptm_bfd_snd(struct bfd_session *bfd, int fbit);
 void ptm_bfd_echo_snd(struct bfd_session *bfd);
 
 int bfd_recv_cb(struct thread *t);
+int bfd_micro_recv_cb(struct thread *t);
 
 
 /*
@@ -506,6 +523,7 @@ void bfd_echo_xmttimer_assign(struct bfd_session *bs, bfd_ev_cb cb);
  */
 int bfd_session_enable(struct bfd_session *bs);
 void bfd_session_disable(struct bfd_session *bs);
+struct bfd_session *bfd_peer_session_init(struct bfd_peer_cfg *bpc);
 struct bfd_session *ptm_bfd_sess_new(struct bfd_peer_cfg *bpc);
 int ptm_bfd_ses_del(struct bfd_peer_cfg *bpc);
 void ptm_bfd_ses_dn(struct bfd_session *bfd, uint8_t diag);
@@ -521,6 +539,10 @@ struct bfd_session *ptm_bfd_sess_find(struct bfd_pkt *cp,
 				      bool is_mhop);
 
 struct bfd_session *bs_peer_find(struct bfd_peer_cfg *bpc);
+struct bfd_session *bs_session_find_by_interface(struct bfd_peer_cfg *bpc,
+					  struct interface *ifp);
+struct bfd_session *bs_find_slave_by_interface(struct bfd_session *bs,
+					  struct interface *ifp);
 int bfd_session_update_label(struct bfd_session *bs, const char *nlabel);
 void bfd_set_polling(struct bfd_session *bs);
 void bs_state_handler(struct bfd_session *bs, int nstate);
